@@ -1,0 +1,11 @@
+import { chromium } from 'playwright';
+const OUT='/home/user/id-card';
+const browser=await chromium.launch();
+const page=await browser.newPage({viewport:{width:1180,height:940}, deviceScaleFactor:2});
+await page.goto('file://'+OUT+'/id-card-live.html');
+await page.waitForTimeout(1600);
+await page.screenshot({path:OUT+'/id-card-live-preview.png'});
+await page.click('#flip'); await page.waitForTimeout(1200);
+await page.screenshot({path:OUT+'/id-card-live-preview-back.png'});
+await browser.close();
+console.log('previews updated');

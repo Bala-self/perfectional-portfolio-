@@ -52,6 +52,284 @@
   var resetAccordion = null;    // filled by the accordion module
   var closeViewer = null;       // filled by the viewer module
 
+  /* Profile card --------------------------------------------------- */
+
+  (function () {
+    var card = document.getElementById('profileCard');
+    var rig = document.getElementById('profileCardRig');
+    if (!card) return;
+
+    var holder = document.getElementById('profileCardHolder');
+    var flipFrame = document.getElementById('profileCardFrame');
+    var rope = { length: 25, lengthVelocity: 0, theta: 0, omega: 0, badgeTheta: 0, badgeOmega: 0 };
+    var drag = null;
+    var hardLocked = false;
+    var frame = 0;
+    var lastTime = 0;
+    var suppressClick = false;
+    var restLength = 25;
+    var gravity = 980;
+    var radialStiffness = 140;
+    var radialDamping = 16;
+    var angularDamping = 2.4;
+    var badgeStiffness = 18;
+    var badgeDamping = 4.6;
+    var topLockEndpoint = -132;
+    var lockReleaseEndpoint = 8;
+    var lockReleaseGap = 30;
+    var maxBadgeTilt = Math.PI / 9;
+    var maxPullLength = Math.min(420, Math.max(280, Math.min(window.innerWidth, window.innerHeight) * 0.72));
+    var frontFace = card.querySelector('.profile-card__face--front');
+    var backFace = card.querySelector('.profile-card__face--back');
+
+    function setFlipped(flipped) {
+      card.classList.toggle('is-flipped', flipped);
+      if (flipFrame) flipFrame.classList.toggle('is-flipped', flipped);
+      card.setAttribute('aria-pressed', String(flipped));
+      if (frontFace) frontFace.setAttribute('aria-hidden', String(flipped));
+      if (backFace) backFace.setAttribute('aria-hidden', String(!flipped));
+      card.setAttribute('aria-label', flipped
+        ? 'Flip profile card to show profile'
+        : 'Flip profile card to show contact details');
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function setPullLocked(locked) {
+      if (rig) rig.classList.toggle('is-pull-locked', locked);
+    }
+
+    function renderRope() {
+      if (!rig) return;
+
+      // The rope endpoint and holder pivot share one polar coordinate. This
+      // keeps the tether attached while the card stretches away from rest.
+      var x = rope.length * Math.sin(rope.theta);
+      var y = rope.length * Math.cos(rope.theta);
+
+      rig.style.setProperty('--pull-x', x.toFixed(2) + 'px');
+      rig.style.setProperty('--pull-y', (y - restLength).toFixed(2) + 'px');
+      rig.style.setProperty('--sway', (rope.badgeTheta * 180 / Math.PI).toFixed(2) + 'deg');
+      rig.style.setProperty('--tether-angle', (rope.theta * 180 / Math.PI).toFixed(2) + 'deg');
+      rig.style.setProperty('--tether-scale', (rope.length / restLength).toFixed(3));
+    }
+
+    function settle(now) {
+      if (drag || prefersReducedMotion()) return;
+
+      if (!lastTime) lastTime = now;
+      var dt = Math.min(0.032, (now - lastTime) / 1000);
+      lastTime = now;
+
+      // Elastic pendulum: gravity swings the rope, while the radial spring
+      // lets the lanyard stretch and return without ever losing its pivot.
+      var radialAcceleration = gravity * (Math.cos(rope.theta) - 1)
+        - radialStiffness * (rope.length - restLength)
+        - radialDamping * rope.lengthVelocity
+        + rope.length * rope.omega * rope.omega;
+      rope.lengthVelocity += radialAcceleration * dt;
+      rope.length = Math.max(8, rope.length + rope.lengthVelocity * dt);
+
+      rope.omega += ((-gravity / rope.length) * Math.sin(rope.theta)
+        - 2 * rope.lengthVelocity / rope.length * rope.omega
+        - angularDamping * rope.omega) * dt;
+      rope.theta += rope.omega * dt;
+
+      // The badge has its own small rotational inertia, so it lags the rope
+      // slightly instead of behaving like a rigidly glued rectangle.
+      var badgeTorque = (rope.theta * 0.24 - rope.badgeTheta) * badgeStiffness
+        - rope.badgeOmega * badgeDamping;
+      rope.badgeOmega += badgeTorque * dt;
+      rope.badgeTheta = clamp(rope.badgeTheta + rope.badgeOmega * dt, -maxBadgeTilt, maxBadgeTilt);
+      if (Math.abs(rope.badgeTheta) >= maxBadgeTilt) {
+        rope.badgeOmega = 0;
+      }
+      renderRope();
+
+      // A real damped system approaches rest asymptotically. Snap only after
+      // its remaining energy is imperceptible so the badge has a true resting
+      // state instead of drifting forever by fractional pixels.
+      if (Math.abs(rope.length - restLength) < 0.6 && Math.abs(rope.lengthVelocity) < 1.2
+          && Math.abs(rope.theta) < 0.012 && Math.abs(rope.omega) < 0.06
+          && Math.abs(rope.badgeTheta) < 0.006 && Math.abs(rope.badgeOmega) < 0.06) {
+        rope.length = restLength;
+        rope.lengthVelocity = 0;
+        rope.theta = 0;
+        rope.omega = 0;
+        rope.badgeTheta = 0;
+        rope.badgeOmega = 0;
+        renderRope();
+        frame = 0;
+        lastTime = 0;
+        return;
+      }
+
+      frame = window.requestAnimationFrame(function (nextTime) {
+        settle(nextTime);
+      });
+    }
+
+    function startSettle() {
+      if (prefersReducedMotion() || frame) return;
+      lastTime = 0;
+      frame = window.requestAnimationFrame(function (time) {
+        settle(time);
+      });
+    }
+
+    function beginDrag(event) {
+      if (prefersReducedMotion() || !rig || !holder) return;
+
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+      }
+
+      drag = {
+        id: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        lastTime: performance.now(),
+        moved: false,
+        locked: hardLocked,
+        lockType: hardLocked ? 'top' : '',
+        lockX: hardLocked ? rope.length * Math.sin(rope.theta) : 0,
+        lockY: hardLocked ? rope.length * Math.cos(rope.theta) : 0,
+      };
+      if (hardLocked) setPullLocked(true);
+      card.classList.add('is-dragging');
+      if (holder) holder.classList.add('is-dragging');
+      card.setPointerCapture(event.pointerId);
+    }
+
+    function moveDrag(event) {
+      if (!drag || event.pointerId !== drag.id) return;
+
+      var distanceX = event.clientX - drag.startX;
+      var distanceY = event.clientY - drag.startY;
+      var now = performance.now();
+      var dt = Math.max(0.008, Math.min(0.08, (now - drag.lastTime) / 1000));
+      // The pointer can pull in any direction. Convert that displacement into
+      // the rope's polar length and angle instead of clamping to a small arc.
+      var rawX = distanceX * 0.85;
+      var rawY = restLength + distanceY * 0.65;
+      var targetX = rawX;
+      var targetY = rawY;
+      var rawLength = Math.hypot(rawX, rawY);
+
+      // Once the card reaches the upper travel boundary, freeze the live
+      // endpoint. The user must pull back through a small release gap before
+      // the card can move again, just like a physical badge caught at a stop.
+      if (!drag.locked && rawY <= topLockEndpoint) {
+        drag.locked = true;
+        drag.lockType = 'top';
+        drag.lockX = rawX;
+        drag.lockY = topLockEndpoint;
+        hardLocked = true;
+        setPullLocked(true);
+      } else if (!drag.locked && rawLength >= maxPullLength) {
+        drag.locked = true;
+        drag.lockType = 'radial';
+        var lockScale = maxPullLength / rawLength;
+        drag.lockX = rawX * lockScale;
+        drag.lockY = rawY * lockScale;
+        setPullLocked(true);
+      } else if (drag.locked
+          && drag.lockType === 'top'
+          && rawY > lockReleaseEndpoint
+          && rawLength < maxPullLength - lockReleaseGap) {
+        drag.locked = false;
+        drag.lockType = '';
+        hardLocked = false;
+        setPullLocked(false);
+      }
+
+      if (drag.locked) {
+        targetX = drag.lockX;
+        targetY = drag.lockY;
+      }
+
+      var targetLength = Math.max(8, Math.hypot(targetX, targetY));
+      var targetTheta = Math.atan2(targetX, targetY);
+
+      if (Math.hypot(distanceX, distanceY) > 4) {
+        drag.moved = true;
+      }
+
+      rope.lengthVelocity = clamp((targetLength - rope.length) / dt, -1600, 1600);
+      rope.omega = clamp((targetTheta - rope.theta) / dt, -14, 14);
+      rope.length = targetLength;
+      rope.theta = targetTheta;
+      rope.badgeOmega = rope.omega * 0.24;
+      rope.badgeTheta = clamp(targetTheta * 0.24, -maxBadgeTilt, maxBadgeTilt);
+      drag.lastTime = now;
+      renderRope();
+      event.preventDefault();
+    }
+
+    function endDrag(event) {
+      if (!drag || event.pointerId !== drag.id) return;
+
+      if (card.hasPointerCapture(event.pointerId)) {
+        card.releasePointerCapture(event.pointerId);
+      }
+      var staysTopLocked = drag.locked && drag.lockType === 'top';
+      if (staysTopLocked) {
+        // A latched top stop is static until the user deliberately pulls the
+        // card back below the anchor. It must not restart the settle loop.
+        rope.lengthVelocity = 0;
+        rope.omega = 0;
+        rope.badgeOmega = 0;
+      }
+      suppressClick = drag.moved;
+      drag = null;
+      hardLocked = staysTopLocked;
+      setPullLocked(staysTopLocked);
+      card.classList.remove('is-dragging');
+      if (holder) holder.classList.remove('is-dragging');
+      if (!staysTopLocked) startSettle();
+    }
+
+    card.addEventListener('click', function (event) {
+      if (suppressClick) {
+        suppressClick = false;
+        event.preventDefault();
+        return;
+      }
+      setFlipped(!card.classList.contains('is-flipped'));
+    });
+
+    card.addEventListener('pointerdown', beginDrag);
+    card.addEventListener('pointermove', moveDrag);
+    card.addEventListener('pointerup', endDrag);
+    card.addEventListener('pointercancel', endDrag);
+
+    resetHooks.push(function () {
+      setFlipped(false);
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+      }
+      lastTime = 0;
+      drag = null;
+      hardLocked = false;
+      setPullLocked(false);
+      rope.length = restLength;
+      rope.lengthVelocity = 0;
+      rope.theta = 0;
+      rope.omega = 0;
+      rope.badgeTheta = 0;
+      rope.badgeOmega = 0;
+      card.classList.remove('is-dragging');
+      if (holder) holder.classList.remove('is-dragging');
+      renderRope();
+    });
+
+    renderRope();
+  })();
+
   /* 1. Project accordion -------------------------------------------- */
 
   var projectItems = Array.prototype.slice.call(document.querySelectorAll('.project-item'));
